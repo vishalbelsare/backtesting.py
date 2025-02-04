@@ -1,12 +1,15 @@
 """
 
-![xkcd.com/1570](https://imgs.xkcd.com/comics/engineer_syllogism.png)
+![xkcd.com/1570](https://imgs.xkcd.com/comics/engineer_syllogism.png){: height=263}
 
 ## Manuals
 
 * [**Quick Start User Guide**](../examples/Quick Start User Guide.html)
 
 ## Tutorials
+
+The tutorials encompass most framework features, so it's important
+and advisable to go through all of them. They are short.
 
 * [Library of Utilities and Composable Base Strategies](../examples/Strategies Library.html)
 * [Multiple Time Frames](../examples/Multiple Time Frames.html)
@@ -15,7 +18,7 @@
 
 These tutorials are also available as live Jupyter notebooks:
 [![Binder](https://mybinder.org/badge_logo.svg)][binder]
-[![Google Colab](https://colab.research.google.com/assets/colab-badge.svg)][colab]
+[![Google Colab](https://colab.research.google.com/assets/colab-badge.png)][colab]
 <br>In Colab, you might have to `!pip install backtesting`.
 
 [binder]: \
@@ -53,10 +56,10 @@ itself find their way back to the community.
 # API Reference Documentation
 """
 try:
-    from ._version import version as __version__  # noqa: F401
+    from ._version import version as __version__
 except ImportError:
     __version__ = '?.?.?'  # Package not installed
 
-from .backtesting import Backtest, Strategy  # noqa: F401
 from . import lib  # noqa: F401
 from ._plotting import set_bokeh_output  # noqa: F401
+from .backtesting import Backtest, Strategy  # noqa: F401

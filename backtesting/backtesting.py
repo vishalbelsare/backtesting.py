@@ -5,21 +5,22 @@ module directly, e.g.
 
     from backtesting import Backtest, Strategy
 """
-import multiprocessing as mp
-import os
+
+from __future__ import annotations
+
 import sys
 import warnings
-from abc import abstractmethod, ABCMeta
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from abc import ABCMeta, abstractmethod
 from copy import copy
 from functools import lru_cache, partial
-from itertools import repeat, product, chain, compress
+from itertools import chain, product, repeat
 from math import copysign
 from numbers import Number
 from typing import Callable, Dict, List, Optional, Sequence, Tuple, Type, Union
 
 import numpy as np
 import pandas as pd
+from joblib import Parallel, delayed
 from numpy.random import default_rng
 
 try:
@@ -29,9 +30,9 @@ except ImportError:
     def _tqdm(seq, **_):
         return seq
 
-from ._plotting import plot
+from ._plotting import plot  # noqa: I001
 from ._stats import compute_stats
-from ._util import _as_str, _Indicator, _Data, try_
+from ._util import _as_str, _Indicator, _Data, _indicator_warmup_nbars, _strategy_indicators, try_
 
 __pdoc__ = {
     'Strategy.__init__': False,
@@ -75,12 +76,13 @@ class Strategy(metaclass=ABCMeta):
             setattr(self, k, v)
         return params
 
-    def I(self,  # noqa: E741, E743
+    def I(self,  # noqa: E743
           func: Callable, *args,
           name=None, plot=True, overlay=None, color=None, scatter=False,
           **kwargs) -> np.ndarray:
         """
-        Declare indicator. An indicator is just an array of values,
+        Declare an indicator. An indicator is just an array of values
+        (or a tuple of such arrays in case of, e.g., MACD indicator),
         but one that is revealed gradually in
         `backtesting.backtesting.Strategy.next` much like
         `backtesting.backtesting.Strategy.data` is.
@@ -90,7 +92,9 @@ class Strategy(metaclass=ABCMeta):
         same length as `backtesting.backtesting.Strategy.data`.
 
         In the plot legend, the indicator is labeled with
-        function name, unless `name` overrides it.
+        function name, unless `name` overrides it. If `func` returns
+        a tuple of arrays, `name` can be a sequence of strings, and
+        its size must agree with the number of arrays returned.
 
         If `plot` is `True`, the indicator is plotted on the resulting
         `backtesting.backtesting.Backtest.plot`.
@@ -114,35 +118,55 @@ class Strategy(metaclass=ABCMeta):
 
             def init():
                 self.sma = self.I(ta.SMA, self.data.Close, self.n_sma)
+
+        .. warning::
+            Rolling indicators may front-pad warm-up values with NaNs.
+            In this case, the **backtest will only begin on the first bar when
+            all declared indicators have non-NaN values** (e.g. bar 201 for a
+            strategy that uses a 200-bar MA).
+            This can affect results.
         """
+        def _format_name(name: str) -> str:
+            return name.format(*map(_as_str, args),
+                               **dict(zip(kwargs.keys(), map(_as_str, kwargs.values()))))
+
         if name is None:
             params = ','.join(filter(None, map(_as_str, chain(args, kwargs.values()))))
             func_name = _as_str(func)
             name = (f'{func_name}({params})' if params else f'{func_name}')
+        elif isinstance(name, str):
+            name = _format_name(name)
+        elif try_(lambda: all(isinstance(item, str) for item in name), False):
+            name = [_format_name(item) for item in name]
         else:
-            name = name.format(*map(_as_str, args),
-                               **dict(zip(kwargs.keys(), map(_as_str, kwargs.values()))))
+            raise TypeError(f'Unexpected `name=` type {type(name)}; expected `str` or '
+                            '`Sequence[str]`')
 
         try:
             value = func(*args, **kwargs)
         except Exception as e:
-            raise RuntimeError(f'Indicator "{name}" errored with exception: {e}')
+            raise RuntimeError(f'Indicator "{name}" error. See traceback above.') from e
 
         if isinstance(value, pd.DataFrame):
             value = value.values.T
 
         if value is not None:
             value = try_(lambda: np.asarray(value, order='C'), None)
-        is_arraylike = value is not None
+        is_arraylike = bool(value is not None and value.shape)
 
         # Optionally flip the array if the user returned e.g. `df.values`
         if is_arraylike and np.argmax(value.shape) == 0:
             value = value.T
 
+        if isinstance(name, list) and (np.atleast_2d(value).shape[0] != len(name)):
+            raise ValueError(
+                f'Length of `name=` ({len(name)}) must agree with the number '
+                f'of arrays the indicator returns ({value.shape[0]}).')
+
         if not is_arraylike or not 1 <= value.ndim <= 2 or value.shape[-1] != len(self._data.Close):
             raise ValueError(
                 'Indicators must return (optionally a tuple of) numpy.arrays of same '
-                f'length as `data` (data shape: {self._data.Close.shape}; indicator "{name}"'
+                f'length as `data` (data shape: {self._data.Close.shape}; indicator "{name}" '
                 f'shape: {getattr(value, "shape" , "")}, returned value: {value})')
 
         if plot and overlay is None and np.issubdtype(value.dtype, np.number):
@@ -190,39 +214,58 @@ class Strategy(metaclass=ABCMeta):
             super().next()
         """
 
-    class __FULL_EQUITY(float):
+    class __FULL_EQUITY(float):  # noqa: N801
         def __repr__(self): return '.9999'
     _FULL_EQUITY = __FULL_EQUITY(1 - sys.float_info.epsilon)
 
     def buy(self, *,
             size: float = _FULL_EQUITY,
-            limit: float = None,
-            stop: float = None,
-            sl: float = None,
-            tp: float = None):
+            limit: Optional[float] = None,
+            stop: Optional[float] = None,
+            sl: Optional[float] = None,
+            tp: Optional[float] = None,
+            tag: object = None) -> 'Order':
         """
-        Place a new long order. For explanation of parameters, see `Order` and its properties.
+        Place a new long order and return it. For explanation of parameters, see `Order`
+        and its properties.
+        Unless you're running `Backtest(..., trade_on_close=True)`,
+        market orders are filled on next bar's open,
+        whereas other order types (limit, stop-limit, stop-market) are filled when
+        the respective conditions are met.
+
+        See `Position.close()` and `Trade.close()` for closing existing positions.
 
         See also `Strategy.sell()`.
         """
-        assert 0 < size < 1 or round(size) == size, \
+        assert 0 < size < 1 or round(size) == size >= 1, \
             "size must be a positive fraction of equity, or a positive whole number of units"
-        return self._broker.new_order(size, limit, stop, sl, tp)
+        return self._broker.new_order(size, limit, stop, sl, tp, tag)
 
     def sell(self, *,
              size: float = _FULL_EQUITY,
-             limit: float = None,
-             stop: float = None,
-             sl: float = None,
-             tp: float = None):
+             limit: Optional[float] = None,
+             stop: Optional[float] = None,
+             sl: Optional[float] = None,
+             tp: Optional[float] = None,
+             tag: object = None) -> 'Order':
         """
-        Place a new short order. For explanation of parameters, see `Order` and its properties.
+        Place a new short order and return it. For explanation of parameters, see `Order`
+        and its properties.
+
+        .. caution::
+            Keep in mind that `self.sell(size=.1)` doesn't close existing `self.buy(size=.1)`
+            trade unless the underlying asset price hasn't changed yet.
+            Use `Trade.close()` or `Position.close()` to exit trades.
 
         See also `Strategy.buy()`.
+
+        .. note::
+            If you merely want to close an existing long position,
+            use `Position.close()` or `Trade.close()`.
         """
-        assert 0 < size < 1 or round(size) == size, \
+        assert 0 < size < 1 or round(size) == size >= 1, \
             "size must be a positive fraction of equity, or a positive whole number of units"
-        return self._broker.new_order(-size, limit, stop, sl, tp)
+        return self._broker.new_order(-size, limit, stop, sl, tp, tag)
 
     @property
     def equity(self) -> float:
@@ -376,11 +419,12 @@ class Order:
     """
     def __init__(self, broker: '_Broker',
                  size: float,
-                 limit_price: float = None,
-                 stop_price: float = None,
-                 sl_price: float = None,
-                 tp_price: float = None,
-                 parent_trade: 'Trade' = None):
+                 limit_price: Optional[float] = None,
+                 stop_price: Optional[float] = None,
+                 sl_price: Optional[float] = None,
+                 tp_price: Optional[float] = None,
+                 parent_trade: Optional['Trade'] = None,
+                 tag: object = None):
         self.__broker = broker
         assert size != 0
         self.__size = size
@@ -389,6 +433,7 @@ class Order:
         self.__sl_price = sl_price
         self.__tp_price = tp_price
         self.__parent_trade = parent_trade
+        self.__tag = tag
 
     def _replace(self, **kwargs):
         for k, v in kwargs.items():
@@ -396,7 +441,7 @@ class Order:
         return self
 
     def __repr__(self):
-        return '<Order {}>'.format(', '.join(f'{param}={round(value, 5)}'
+        return '<Order {}>'.format(', '.join(f'{param}={try_(lambda: round(value, 5), value)!r}'
                                              for param, value in (
                                                  ('size', self.__size),
                                                  ('limit', self.__limit_price),
@@ -404,6 +449,7 @@ class Order:
                                                  ('sl', self.__sl_price),
                                                  ('tp', self.__tp_price),
                                                  ('contingent', self.is_contingent),
+                                                 ('tag', self.__tag),
                                              ) if value is not None))
 
     def cancel(self):
@@ -416,8 +462,7 @@ class Order:
             elif self is trade._tp_order:
                 trade._replace(tp_order=None)
             else:
-                # XXX: https://github.com/kernc/backtesting.py/issues/251#issuecomment-835634984 ???
-                assert False
+                pass  # Order placed by Trade.close()
 
     # Fields getters
 
@@ -475,6 +520,14 @@ class Order:
     def parent_trade(self):
         return self.__parent_trade
 
+    @property
+    def tag(self):
+        """
+        Arbitrary value (such as a string) which, if set, enables tracking
+        of this order and the associated `Trade` (see `Trade.tag`).
+        """
+        return self.__tag
+
     __pdoc__['Order.parent_trade'] = False
 
     # Extra properties
@@ -509,7 +562,7 @@ class Trade:
     When an `Order` is filled, it results in an active `Trade`.
     Find active trades in `Strategy.trades` and closed, settled trades in `Strategy.closed_trades`.
     """
-    def __init__(self, broker: '_Broker', size: int, entry_price: float, entry_bar):
+    def __init__(self, broker: '_Broker', size: int, entry_price: float, entry_bar, tag):
         self.__broker = broker
         self.__size = size
         self.__entry_price = entry_price
@@ -518,10 +571,13 @@ class Trade:
         self.__exit_bar: Optional[int] = None
         self.__sl_order: Optional[Order] = None
         self.__tp_order: Optional[Order] = None
+        self.__tag = tag
+        self._commissions = 0
 
     def __repr__(self):
         return f'<Trade size={self.__size} time={self.__entry_bar}-{self.__exit_bar or ""} ' \
-               f'price={self.__entry_price}-{self.__exit_price or ""} pl={self.pl:.0f}>'
+               f'price={self.__entry_price}-{self.__exit_price or ""} pl={self.pl:.0f}' \
+               f'{" tag="+str(self.__tag) if self.__tag is not None else ""}>'
 
     def _replace(self, **kwargs):
         for k, v in kwargs.items():
@@ -535,7 +591,7 @@ class Trade:
         """Place new `Order` to close `portion` of the trade at next market price."""
         assert 0 < portion <= 1, "portion must be a fraction between 0 and 1"
         size = copysign(max(1, round(abs(self.__size) * portion)), -self.__size)
-        order = Order(self.__broker, size, parent_trade=self)
+        order = Order(self.__broker, size, parent_trade=self, tag=self.__tag)
         self.__broker.orders.insert(0, order)
 
     # Fields getters
@@ -567,6 +623,19 @@ class Trade:
         (or None if the trade is still active).
         """
         return self.__exit_bar
+
+    @property
+    def tag(self):
+        """
+        A tag value inherited from the `Order` that opened
+        this trade.
+
+        This can be used to track trades and apply conditional
+        logic / subgroup analysis.
+
+        See also `Order.tag`.
+        """
+        return self.__tag
 
     @property
     def _sl_order(self):
@@ -652,28 +721,39 @@ class Trade:
 
     def __set_contingent(self, type, price):
         assert type in ('sl', 'tp')
-        assert price is None or 0 < price < np.inf
+        assert price is None or 0 < price < np.inf, f'Make sure 0 < price < inf! price: {price}'
         attr = f'_{self.__class__.__qualname__}__{type}_order'
         order: Order = getattr(self, attr)
         if order:
             order.cancel()
         if price:
-            kwargs = dict(stop=price) if type == 'sl' else dict(limit=price)
-            order = self.__broker.new_order(-self.size, trade=self, **kwargs)
+            kwargs = {'stop': price} if type == 'sl' else {'limit': price}
+            order = self.__broker.new_order(-self.size, trade=self, tag=self.tag, **kwargs)
             setattr(self, attr, order)
 
 
 class _Broker:
-    def __init__(self, *, data, cash, commission, margin,
+    def __init__(self, *, data, cash, spread, commission, margin,
                  trade_on_close, hedging, exclusive_orders, index):
-        assert 0 < cash, f"cash should be >0, is {cash}"
-        assert -.1 <= commission < .1, \
-            ("commission should be between -10% "
-             f"(e.g. market-maker's rebates) and 10% (fees), is {commission}")
+        assert cash > 0, f"cash should be > 0, is {cash}"
         assert 0 < margin <= 1, f"margin should be between 0 and 1, is {margin}"
         self._data: _Data = data
         self._cash = cash
-        self._commission = commission
+
+        if callable(commission):
+            self._commission = commission
+        else:
+            try:
+                self._commission_fixed, self._commission_relative = commission
+            except TypeError:
+                self._commission_fixed, self._commission_relative = 0, commission
+            assert self._commission_fixed >= 0, 'Need fixed cash commission in $ >= 0'
+            assert -.1 <= self._commission_relative < .1, \
+                ("commission should be between -10% "
+                 f"(e.g. market-maker's rebates) and 10% (fees), is {self._commission_relative}")
+            self._commission = self._commission_func
+
+        self._spread = spread
         self._leverage = 1 / margin
         self._trade_on_close = trade_on_close
         self._hedging = hedging
@@ -685,17 +765,21 @@ class _Broker:
         self.position = Position(self)
         self.closed_trades: List[Trade] = []
 
+    def _commission_func(self, order_size, price):
+        return self._commission_fixed + abs(order_size) * price * self._commission_relative
+
     def __repr__(self):
         return f'<Broker: {self._cash:.0f}{self.position.pl:+.1f} ({len(self.trades)} trades)>'
 
     def new_order(self,
                   size: float,
-                  limit: float = None,
-                  stop: float = None,
-                  sl: float = None,
-                  tp: float = None,
+                  limit: Optional[float] = None,
+                  stop: Optional[float] = None,
+                  sl: Optional[float] = None,
+                  tp: Optional[float] = None,
+                  tag: object = None,
                   *,
-                  trade: Trade = None):
+                  trade: Optional[Trade] = None) -> Order:
         """
         Argument size indicates whether the order is long or short
         """
@@ -706,6 +790,7 @@ class _Broker:
         tp = tp and float(tp)
 
         is_long = size > 0
+        assert size != 0, size
         adjusted_price = self._adjusted_price(size)
 
         if is_long:
@@ -719,7 +804,7 @@ class _Broker:
                     "Short orders require: "
                     f"TP ({tp}) < LIMIT ({limit or stop or adjusted_price}) < SL ({sl})")
 
-        order = Order(self, size, limit, stop, sl, tp, trade)
+        order = Order(self, size, limit, stop, sl, tp, trade, tag)
         # Put the new order in the order queue,
         # inserting SL/TP/trade-closing orders in-front
         if trade:
@@ -745,10 +830,10 @@ class _Broker:
 
     def _adjusted_price(self, size=None, price=None) -> float:
         """
-        Long/short `price`, adjusted for commisions.
+        Long/short `price`, adjusted for spread.
         In long positions, the adjusted price is a fraction higher, and vice versa.
         """
-        return (price or self.last_price) * (1 + copysign(self._commission, size))
+        return (price or self.last_price) * (1 + copysign(self._spread, size))
 
     @property
     def equity(self) -> float:
@@ -780,7 +865,6 @@ class _Broker:
     def _process_orders(self):
         data = self._data
         open, high, low = data.Open[-1], data.High[-1], data.Low[-1]
-        prev_close = data.Close[-2]
         reprocess_orders = False
 
         # Process orders
@@ -793,7 +877,7 @@ class _Broker:
             # Check if stop condition was hit
             stop_price = order.stop
             if stop_price:
-                is_stop_hit = ((high > stop_price) if order.is_long else (low < stop_price))
+                is_stop_hit = ((high >= stop_price) if order.is_long else (low <= stop_price))
                 if not is_stop_hit:
                     continue
 
@@ -804,13 +888,13 @@ class _Broker:
             # Determine purchase price.
             # Check if limit order can be filled.
             if order.limit:
-                is_limit_hit = low < order.limit if order.is_long else high > order.limit
+                is_limit_hit = low <= order.limit if order.is_long else high >= order.limit
                 # When stop and limit are hit within the same bar, we pessimistically
                 # assume limit was hit before the stop (i.e. "before it counts")
                 is_limit_hit_before_stop = (is_limit_hit and
-                                            (order.limit < (stop_price or -np.inf)
+                                            (order.limit <= (stop_price or -np.inf)
                                              if order.is_long
-                                             else order.limit > (stop_price or np.inf)))
+                                             else order.limit >= (stop_price or np.inf)))
                 if not is_limit_hit or is_limit_hit_before_stop:
                     continue
 
@@ -820,10 +904,11 @@ class _Broker:
                          max(stop_price or open, order.limit))
             else:
                 # Market-if-touched / market order
-                price = prev_close if self._trade_on_close else open
-                price = (max(price, stop_price or -np.inf)
-                         if order.is_long else
-                         min(price, stop_price or np.inf))
+                # Contingent orders always on next open
+                prev_close = data.Close[-2]
+                price = prev_close if self._trade_on_close and not order.is_contingent else open
+                if stop_price:
+                    price = max(price, stop_price) if order.is_long else min(price, stop_price)
 
             # Determine entry/exit bar index
             is_market_order = not order.limit and not stop_price
@@ -855,15 +940,17 @@ class _Broker:
             # Adjust price to include commission (or bid-ask spread).
             # In long positions, the adjusted price is a fraction higher, and vice versa.
             adjusted_price = self._adjusted_price(order.size, price)
+            adjusted_price_plus_commission = adjusted_price + self._commission(order.size, price)
 
             # If order size was specified proportionally,
             # precompute true size in units, accounting for margin and spread/commissions
             size = order.size
             if -1 < size < 1:
                 size = copysign(int((self.margin_available * self._leverage * abs(size))
-                                    // adjusted_price), size)
+                                    // adjusted_price_plus_commission), size)
                 # Not enough cash/margin even for a single unit
                 if not size:
+                    # XXX: The order is canceled by the broker?
                     self.orders.remove(order)
                     continue
             assert size == round(size)
@@ -892,14 +979,20 @@ class _Broker:
                     if not need_size:
                         break
 
-            # If we don't have enough liquidity to cover for the order, cancel it
-            if abs(need_size) * adjusted_price > self.margin_available * self._leverage:
+            # If we don't have enough liquidity to cover for the order, the broker CANCELS it
+            if abs(need_size) * adjusted_price_plus_commission > \
+                    self.margin_available * self._leverage:
                 self.orders.remove(order)
                 continue
 
             # Open a new trade
             if need_size:
-                self._open_trade(adjusted_price, need_size, order.sl, order.tp, time_index)
+                self._open_trade(adjusted_price,
+                                 need_size,
+                                 order.sl,
+                                 order.tp,
+                                 time_index,
+                                 order.tag)
 
                 # We need to reprocess the SL/TP orders newly added to the queue.
                 # This allows e.g. SL hitting in the same bar the order was open.
@@ -954,12 +1047,23 @@ class _Broker:
         if trade._tp_order:
             self.orders.remove(trade._tp_order)
 
-        self.closed_trades.append(trade._replace(exit_price=price, exit_bar=time_index))
-        self._cash += trade.pl
+        closed_trade = trade._replace(exit_price=price, exit_bar=time_index)
+        self.closed_trades.append(closed_trade)
+        # Apply commission one more time at trade exit
+        commission = self._commission(trade.size, price)
+        self._cash += trade.pl - commission
+        # Save commissions on Trade instance for stats
+        trade_open_commission = self._commission(closed_trade.size, closed_trade.entry_price)
+        # applied here instead of on Trade open because size could have changed
+        # by way of _reduce_trade()
+        closed_trade._commissions = commission + trade_open_commission
 
-    def _open_trade(self, price: float, size: int, sl: float, tp: float, time_index: int):
-        trade = Trade(self, size, price, time_index)
+    def _open_trade(self, price: float, size: int,
+                    sl: Optional[float], tp: Optional[float], time_index: int, tag):
+        trade = Trade(self, size, price, time_index, tag)
         self.trades.append(trade)
+        # Apply broker commission at trade open
+        self._cash -= self._commission(size, price)
         # Create SL/TP (bracket) orders.
         # Make sure SL order is created first so it gets adversarially processed before TP order
         # in case of an ambiguous tie (both hit within a single bar).
@@ -985,11 +1089,13 @@ class Backtest:
                  strategy: Type[Strategy],
                  *,
                  cash: float = 10_000,
-                 commission: float = .0,
+                 spread: float = .0,
+                 commission: Union[float, Tuple[float, float]] = .0,
                  margin: float = 1.,
                  trade_on_close=False,
                  hedging=False,
-                 exclusive_orders=False
+                 exclusive_orders=False,
+                 finalize_trades=False,
                  ):
         """
         Initialize a backtest. Requires data and a strategy to test.
@@ -1011,11 +1117,33 @@ class Backtest:
 
         `cash` is the initial cash to start with.
 
-        `commission` is the commission ratio. E.g. if your broker's commission
-        is 1% of trade value, set commission to `0.01`. Note, if you wish to
-        account for bid-ask spread, you can approximate doing so by increasing
-        the commission, e.g. set it to `0.0002` for commission-less forex
-        trading where the average spread is roughly 0.2‰ of asking price.
+        `spread` is the the constant bid-ask spread rate (relative to the price).
+        E.g. set it to `0.0002` for commission-less forex
+        trading where the average spread is roughly 0.2‰ of the asking price.
+
+        `commission` is the commission rate. E.g. if your broker's commission
+        is 1% of order value, set commission to `0.01`.
+        The commission is applied twice: at trade entry and at trade exit.
+        Besides one single floating value, `commission` can also be a tuple of floating
+        values `(fixed, relative)`. E.g. set it to `(100, .01)`
+        if your broker charges minimum $100 + 1%.
+        Additionally, `commission` can be a callable
+        `func(order_size: int, price: float) -> float`
+        (note, order size is negative for short orders),
+        which can be used to model more complex commission structures.
+        Negative commission values are interpreted as market-maker's rebates.
+
+        .. note::
+            Before v0.4.0, the commission was only applied once, like `spread` is now.
+            If you want to keep the old behavior, simply set `spread` instead.
+
+        .. note::
+            With nonzero `commission`, long and short orders will be placed
+            at an adjusted price that is slightly higher or lower (respectively)
+            than the current price. See e.g.
+            [#153](https://github.com/kernc/backtesting.py/issues/153),
+            [#538](https://github.com/kernc/backtesting.py/issues/538),
+            [#633](https://github.com/kernc/backtesting.py/issues/633).
 
         `margin` is the required margin (ratio) of a leveraged account.
         No difference is made between initial and maintenance margins.
@@ -1034,16 +1162,26 @@ class Backtest:
         trade/position, making at most a single trade (long or short) in effect
         at each time.
 
+        If `finalize_trades` is `True`, the trades that are still
+        [active and ongoing] at the end of the backtest will be closed on
+        the last bar and will contribute to the computed backtest statistics.
+
         [FIFO]: https://www.investopedia.com/terms/n/nfa-compliance-rule-2-43b.asp
-        """
+        [active and ongoing]: https://kernc.github.io/backtesting.py/doc/backtesting/backtesting.html#backtesting.backtesting.Strategy.trades
+        """  # noqa: E501
 
         if not (isinstance(strategy, type) and issubclass(strategy, Strategy)):
             raise TypeError('`strategy` must be a Strategy sub-type')
         if not isinstance(data, pd.DataFrame):
             raise TypeError("`data` must be a pandas.DataFrame with columns")
-        if not isinstance(commission, Number):
-            raise TypeError('`commission` must be a float value, percent of '
+        if not isinstance(spread, Number):
+            raise TypeError('`spread` must be a float value, percent of '
                             'entry order price')
+        if not isinstance(commission, (Number, tuple)) and not callable(commission):
+            raise TypeError('`commission` must be a float percent of order value, '
+                            'a tuple of `(fixed, relative)` commission, '
+                            'or a function that takes `(order_size, price)`'
+                            'and returns commission dollar value')
 
         data = data.copy(deep=False)
 
@@ -1086,12 +1224,13 @@ class Backtest:
 
         self._data: pd.DataFrame = data
         self._broker = partial(
-            _Broker, cash=cash, commission=commission, margin=margin,
+            _Broker, cash=cash, spread=spread, commission=commission, margin=margin,
             trade_on_close=trade_on_close, hedging=hedging,
             exclusive_orders=exclusive_orders, index=data.index,
         )
         self._strategy = strategy
         self._results: Optional[pd.Series] = None
+        self._finalize_trades = bool(finalize_trades)
 
     def run(self, **kwargs) -> pd.Series:
         """
@@ -1103,34 +1242,43 @@ class Backtest:
             Start                     2004-08-19 00:00:00
             End                       2013-03-01 00:00:00
             Duration                   3116 days 00:00:00
-            Exposure Time [%]                     93.9944
-            Equity Final [$]                      51959.9
-            Equity Peak [$]                       75787.4
-            Return [%]                            419.599
-            Buy & Hold Return [%]                 703.458
-            Return (Ann.) [%]                      21.328
-            Volatility (Ann.) [%]                 36.5383
-            Sharpe Ratio                         0.583718
-            Sortino Ratio                         1.09239
-            Calmar Ratio                         0.444518
-            Max. Drawdown [%]                    -47.9801
+            Exposure Time [%]                    96.74115
+            Equity Final [$]                     51422.99
+            Equity Peak [$]                      75787.44
+            Return [%]                           414.2299
+            Buy & Hold Return [%]               703.45824
+            Return (Ann.) [%]                    21.18026
+            Volatility (Ann.) [%]                36.49391
+            CAGR [%]                             14.15984
+            Sharpe Ratio                          0.58038
+            Sortino Ratio                         1.08479
+            Calmar Ratio                          0.44144
+            Max. Drawdown [%]                   -47.98013
             Avg. Drawdown [%]                    -5.92585
             Max. Drawdown Duration      584 days 00:00:00
             Avg. Drawdown Duration       41 days 00:00:00
-            # Trades                                   65
-            Win Rate [%]                          46.1538
-            Best Trade [%]                         53.596
-            Worst Trade [%]                      -18.3989
-            Avg. Trade [%]                        2.35371
+            # Trades                                   66
+            Win Rate [%]                          46.9697
+            Best Trade [%]                       53.59595
+            Worst Trade [%]                     -18.39887
+            Avg. Trade [%]                        2.53172
             Max. Trade Duration         183 days 00:00:00
             Avg. Trade Duration          46 days 00:00:00
-            Profit Factor                         2.08802
-            Expectancy [%]                        8.79171
-            SQN                                  0.916893
+            Profit Factor                         2.16795
+            Expectancy [%]                        3.27481
+            SQN                                   1.07662
+            Kelly Criterion                       0.15187
             _strategy                            SmaCross
             _equity_curve                           Eq...
             _trades                       Size  EntryB...
             dtype: object
+
+        .. warning::
+            You may obtain different results for different strategy parameters.
+            E.g. if you use 50- and 200-bar SMA, the trading simulation will
+            begin on bar 201. The actual length of delay is equal to the lookback
+            period of the `Strategy.I` indicator which lags the most.
+            Obviously, this can affect results.
         """
         data = _Data(self._data.copy(deep=False))
         broker: _Broker = self._broker(data=data)
@@ -1140,14 +1288,11 @@ class Backtest:
         data._update()  # Strategy.init might have changed/added to data.df
 
         # Indicators used in Strategy.next()
-        indicator_attrs = {attr: indicator
-                           for attr, indicator in strategy.__dict__.items()
-                           if isinstance(indicator, _Indicator)}.items()
+        indicator_attrs = _strategy_indicators(strategy)
 
         # Skip first few candles where indicators are still "warming up"
         # +1 to have at least two entries available
-        start = 1 + max((np.isnan(indicator.astype(float)).argmin(axis=-1).max()
-                         for _, indicator in indicator_attrs), default=0)
+        start = 1 + _indicator_warmup_nbars(strategy)
 
         # Disable "invalid value encountered in ..." warnings. Comparison
         # np.nan >= 3 is not invalid; it's False.
@@ -1169,14 +1314,15 @@ class Backtest:
                 # Next tick, a moment before bar close
                 strategy.next()
             else:
-                # Close any remaining open trades so they produce some stats
-                for trade in broker.trades:
-                    trade.close()
+                if self._finalize_trades is True:
+                    # Close any remaining open trades so they produce some stats
+                    for trade in broker.trades:
+                        trade.close()
 
-                # Re-run broker one last time to handle orders placed in the last strategy
-                # iteration. Use the same OHLC values as in the last broker iteration.
-                if start < len(self._data):
-                    try_(broker.next, exception=_OutOfMoneyError)
+                    # HACK: Re-run broker one last time to handle close orders placed in the last
+                    #  strategy iteration. Use the same OHLC values as in the last broker iteration.
+                    if start < len(self._data):
+                        try_(broker.next, exception=_OutOfMoneyError)
 
             # Set data back to full length
             # for future `indicator._opts['data'].index` calls to work
@@ -1196,11 +1342,11 @@ class Backtest:
     def optimize(self, *,
                  maximize: Union[str, Callable[[pd.Series], float]] = 'SQN',
                  method: str = 'grid',
-                 max_tries: Union[int, float] = None,
-                 constraint: Callable[[dict], bool] = None,
+                 max_tries: Optional[Union[int, float]] = None,
+                 constraint: Optional[Callable[[dict], bool]] = None,
                  return_heatmap: bool = False,
                  return_optimization: bool = False,
-                 random_state: int = None,
+                 random_state: Optional[int] = None,
                  **kwargs) -> Union[pd.Series,
                                     Tuple[pd.Series, pd.Series],
                                     Tuple[pd.Series, pd.Series, dict]]:
@@ -1218,11 +1364,10 @@ class Backtest:
 
         * `"grid"` which does an exhaustive (or randomized) search over the
           cartesian product of parameter combinations, and
-        * `"skopt"` which finds close-to-optimal strategy parameters using
+        * `"sambo"` which finds close-to-optimal strategy parameters using
           [model-based optimization], making at most `max_tries` evaluations.
 
-        [model-based optimization]: \
-            https://scikit-optimize.github.io/stable/auto_examples/bayesian-optimization.html
+        [model-based optimization]: https://sambo-optimization.github.io
 
         `max_tries` is the maximal number of strategy runs to perform.
         If `method="grid"`, this results in randomized grid search.
@@ -1230,7 +1375,7 @@ class Backtest:
         number of runs to approximately that fraction of full grid space.
         Alternatively, if integer, it denotes the absolute maximum number
         of evaluations. If unspecified (default), grid search is exhaustive,
-        whereas for `method="skopt"`, `max_tries` is set to 200.
+        whereas for `method="sambo"`, `max_tries` is set to 200.
 
         `constraint` is a function that accepts a dict-like object of
         parameters (with values) and returns `True` when the combination
@@ -1243,16 +1388,14 @@ class Backtest:
         inspected or projected onto 2D to plot a heatmap
         (see `backtesting.lib.plot_heatmaps()`).
 
-        If `return_optimization` is True and `method = 'skopt'`,
+        If `return_optimization` is True and `method = 'sambo'`,
         in addition to result series (and maybe heatmap), return raw
         [`scipy.optimize.OptimizeResult`][OptimizeResult] for further
-        inspection, e.g. with [scikit-optimize]\
-        [plotting tools].
+        inspection, e.g. with [SAMBO]'s [plotting tools].
 
-        [OptimizeResult]: \
-            https://docs.scipy.org/doc/scipy/reference/generated/scipy.optimize.OptimizeResult.html
-        [scikit-optimize]: https://scikit-optimize.github.io
-        [plotting tools]: https://scikit-optimize.github.io/stable/modules/plots.html
+        [OptimizeResult]: https://sambo-optimization.github.io/doc/sambo/#sambo.OptimizeResult
+        [SAMBO]: https://sambo-optimization.github.io
+        [plotting tools]: https://sambo-optimization.github.io/doc/sambo/plot.html
 
         If you want reproducible optimization results, set `random_state`
         to a fixed integer random seed.
@@ -1274,8 +1417,9 @@ class Backtest:
         maximize_key = None
         if isinstance(maximize, str):
             maximize_key = str(maximize)
-            stats = self._results if self._results is not None else self.run()
-            if maximize not in stats:
+            stats_keys = compute_stats(
+                [], np.r_[[np.nan]], pd.DataFrame({col: [np.nan] for col in ('Close',)}), None, 0).index
+            if maximize not in stats_keys:
                 raise ValueError('`maximize`, if str, must match a key in pd.Series '
                                  'result of backtest.run()')
 
@@ -1286,6 +1430,7 @@ class Backtest:
             raise TypeError('`maximize` must be str (a field of backtest.run() result '
                             'Series) or a function that accepts result Series '
                             'and returns a number; the higher the better')
+        assert callable(maximize), maximize
 
         have_constraint = bool(constraint)
         if constraint is None:
@@ -1297,9 +1442,14 @@ class Backtest:
             raise TypeError("`constraint` must be a function that accepts a dict "
                             "of strategy parameters and returns a bool whether "
                             "the combination of parameters is admissible or not")
+        assert callable(constraint), constraint
 
-        if return_optimization and method != 'skopt':
-            raise ValueError("return_optimization=True only valid if method='skopt'")
+        if method == 'skopt':
+            method = 'sambo'
+            warnings.warn('`Backtest.optimize(method="skopt")` is deprecated. Use `method="sambo"`.',
+                          DeprecationWarning, stacklevel=2)
+        if return_optimization and method != 'sambo':
+            raise ValueError("return_optimization=True only valid if method='sambo'")
 
         def _tuple(x):
             return x if isinstance(x, Sequence) and not isinstance(x, str) else (x,)
@@ -1314,7 +1464,7 @@ class Backtest:
                 return self[item]
 
         def _grid_size():
-            size = np.prod([len(_tuple(v)) for v in kwargs.values()])
+            size = int(np.prod([len(_tuple(v)) for v in kwargs.values()]))
             if size < 10_000 and have_constraint:
                 size = sum(1 for p in product(*(zip(repeat(k), _tuple(v))
                                                 for k, v in kwargs.items()))
@@ -1330,7 +1480,7 @@ class Backtest:
                             for params in (AttrDict(params)
                                            for params in product(*(zip(repeat(k), _tuple(v))
                                                                    for k, v in kwargs.items())))
-                            if constraint(params)  # type: ignore
+                            if constraint(params)
                             and rand() <= grid_frac]
             if not param_combos:
                 raise ValueError('No admissible parameter combinations to test')
@@ -1345,67 +1495,35 @@ class Backtest:
                                     [p.values() for p in param_combos],
                                     names=next(iter(param_combos)).keys()))
 
-            def _batch(seq):
-                n = np.clip(int(len(seq) // (os.cpu_count() or 1)), 1, 300)
-                for i in range(0, len(seq), n):
-                    yield seq[i:i + n]
+            with Parallel(prefer='threads', require='sharedmem', max_nbytes='50M',
+                          n_jobs=-2, return_as='generator') as parallel:
+                results = _tqdm(
+                    parallel(delayed(self._mp_task)(self, params, maximize=maximize)
+                             for params in param_combos),
+                    total=len(param_combos),
+                    desc='Backtest.optimize')
+                for value, params in zip(results, param_combos):
+                    heatmap[tuple(params.values())] = value
 
-            # Save necessary objects into "global" state; pass into concurrent executor
-            # (and thus pickle) nothing but two numbers; receive nothing but numbers.
-            # With start method "fork", children processes will inherit parent address space
-            # in a copy-on-write manner, achieving better performance/RAM benefit.
-            backtest_uuid = np.random.random()
-            param_batches = list(_batch(param_combos))
-            Backtest._mp_backtests[backtest_uuid] = (self, param_batches, maximize)  # type: ignore
-            try:
-                # If multiprocessing start method is 'fork' (i.e. on POSIX), use
-                # a pool of processes to compute results in parallel.
-                # Otherwise (i.e. on Windos), sequential computation will be "faster".
-                if mp.get_start_method(allow_none=False) == 'fork':
-                    with ProcessPoolExecutor() as executor:
-                        futures = [executor.submit(Backtest._mp_task, backtest_uuid, i)
-                                   for i in range(len(param_batches))]
-                        for future in _tqdm(as_completed(futures), total=len(futures),
-                                            desc='Backtest.optimize'):
-                            batch_index, values = future.result()
-                            for value, params in zip(values, param_batches[batch_index]):
-                                heatmap[tuple(params.values())] = value
-                else:
-                    if os.name == 'posix':
-                        warnings.warn("For multiprocessing support in `Backtest.optimize()` "
-                                      "set multiprocessing start method to 'fork'.")
-                    for batch_index in _tqdm(range(len(param_batches))):
-                        _, values = Backtest._mp_task(backtest_uuid, batch_index)
-                        for value, params in zip(values, param_batches[batch_index]):
-                            heatmap[tuple(params.values())] = value
-            finally:
-                del Backtest._mp_backtests[backtest_uuid]
-
-            best_params = heatmap.idxmax()
-
-            if pd.isnull(best_params):
+            if pd.isnull(heatmap).all():
                 # No trade was made in any of the runs. Just make a random
                 # run so we get some, if empty, results
                 stats = self.run(**param_combos[0])
             else:
+                best_params = heatmap.idxmax(skipna=True)
                 stats = self.run(**dict(zip(heatmap.index.names, best_params)))
 
             if return_heatmap:
                 return stats, heatmap
             return stats
 
-        def _optimize_skopt() -> Union[pd.Series,
+        def _optimize_sambo() -> Union[pd.Series,
                                        Tuple[pd.Series, pd.Series],
                                        Tuple[pd.Series, pd.Series, dict]]:
             try:
-                from skopt import forest_minimize
-                from skopt.space import Integer, Real, Categorical
-                from skopt.utils import use_named_args
-                from skopt.callbacks import DeltaXStopper
-                from skopt.learning import ExtraTreesRegressor
+                import sambo
             except ImportError:
-                raise ImportError("Need package 'scikit-optimize' for method='skopt'. "
-                                  "pip install scikit-optimize")
+                raise ImportError("Need package 'sambo' for method='sambo'. pip install sambo") from None
 
             nonlocal max_tries
             max_tries = (200 if max_tries is None else
@@ -1416,94 +1534,78 @@ class Backtest:
             for key, values in kwargs.items():
                 values = np.asarray(values)
                 if values.dtype.kind in 'mM':  # timedelta, datetime64
-                    # these dtypes are unsupported in skopt, so convert to raw int
+                    # these dtypes are unsupported in SAMBO, so convert to raw int
                     # TODO: save dtype and convert back later
                     values = values.astype(int)
 
                 if values.dtype.kind in 'iumM':
-                    dimensions.append(Integer(low=values.min(), high=values.max(), name=key))
+                    dimensions.append((values.min(), values.max() + 1))
                 elif values.dtype.kind == 'f':
-                    dimensions.append(Real(low=values.min(), high=values.max(), name=key))
+                    dimensions.append((values.min(), values.max()))
                 else:
-                    dimensions.append(Categorical(values.tolist(), name=key, transform='onehot'))
+                    dimensions.append(values.tolist())
 
-            # Avoid recomputing re-evaluations:
-            # "The objective has been evaluated at this point before."
-            # https://github.com/scikit-optimize/scikit-optimize/issues/302
-            memoized_run = lru_cache()(lambda tup: self.run(**dict(tup)))
+            # Avoid recomputing re-evaluations
+            @lru_cache()
+            def memoized_run(tup):
+                nonlocal maximize, self
+                stats = self.run(**dict(tup))
+                return -maximize(stats)
 
-            # np.inf/np.nan breaks sklearn, np.finfo(float).max breaks skopt.plots.plot_objective
-            INVALID = 1e300
             progress = iter(_tqdm(repeat(None), total=max_tries, desc='Backtest.optimize'))
+            _names = tuple(kwargs.keys())
 
-            @use_named_args(dimensions=dimensions)
-            def objective_function(**params):
+            def objective_function(x):
+                nonlocal progress, memoized_run, constraint, _names
                 next(progress)
-                # Check constraints
-                # TODO: Adjust after https://github.com/scikit-optimize/scikit-optimize/pull/971
-                if not constraint(AttrDict(params)):
-                    return INVALID
-                res = memoized_run(tuple(params.items()))
-                value = -maximize(res)
-                if np.isnan(value):
-                    return INVALID
-                return value
+                value = memoized_run(tuple(zip(_names, x)))
+                return 0 if np.isnan(value) else value
 
-            with warnings.catch_warnings():
-                warnings.filterwarnings(
-                    'ignore', 'The objective has been evaluated at this point before.')
+            def cons(x):
+                nonlocal constraint, _names
+                return constraint(AttrDict(zip(_names, x)))
 
-                res = forest_minimize(
-                    func=objective_function,
-                    dimensions=dimensions,
-                    n_calls=max_tries,
-                    base_estimator=ExtraTreesRegressor(n_estimators=20, min_samples_leaf=2),
-                    acq_func='LCB',
-                    kappa=3,
-                    n_initial_points=min(max_tries, 20 + 3 * len(kwargs)),
-                    initial_point_generator='lhs',  # 'sobel' requires n_initial_points ~ 2**N
-                    callback=DeltaXStopper(9e-7),
-                    random_state=random_state)
+            res = sambo.minimize(
+                fun=objective_function,
+                bounds=dimensions,
+                constraints=cons,
+                max_iter=max_tries,
+                method='sceua',
+                rng=random_state)
 
             stats = self.run(**dict(zip(kwargs.keys(), res.x)))
             output = [stats]
 
             if return_heatmap:
-                heatmap = pd.Series(dict(zip(map(tuple, res.x_iters), -res.func_vals)),
+                heatmap = pd.Series(dict(zip(map(tuple, res.xv), -res.funv)),
                                     name=maximize_key)
                 heatmap.index.names = kwargs.keys()
-                heatmap = heatmap[heatmap != -INVALID]
                 heatmap.sort_index(inplace=True)
                 output.append(heatmap)
 
             if return_optimization:
-                valid = res.func_vals != INVALID
-                res.x_iters = list(compress(res.x_iters, valid))
-                res.func_vals = res.func_vals[valid]
                 output.append(res)
 
             return stats if len(output) == 1 else tuple(output)
 
         if method == 'grid':
             output = _optimize_grid()
-        elif method == 'skopt':
-            output = _optimize_skopt()
+        elif method in ('sambo', 'skopt'):
+            output = _optimize_sambo()
         else:
-            raise ValueError(f"Method should be 'grid' or 'skopt', not {method!r}")
+            raise ValueError(f"Method should be 'grid' or 'sambo', not {method!r}")
         return output
 
     @staticmethod
-    def _mp_task(backtest_uuid, batch_index):
-        bt, param_batches, maximize_func = Backtest._mp_backtests[backtest_uuid]
-        return batch_index, [maximize_func(stats) if stats['# Trades'] else np.nan
-                             for stats in (bt.run(**params)
-                                           for params in param_batches[batch_index])]
+    def _mp_task(bt, params, *, maximize):
+        stats = bt.run(**params)
+        return maximize(stats) if stats['# Trades'] else np.nan
 
     _mp_backtests: Dict[float, Tuple['Backtest', List, Callable]] = {}
 
     def plot(self, *, results: pd.Series = None, filename=None, plot_width=None,
              plot_equity=True, plot_return=False, plot_pl=True,
-             plot_volume=True, plot_drawdown=False,
+             plot_volume=True, plot_drawdown=False, plot_trades=True,
              smooth_equity=False, relative_equity=True,
              superimpose: Union[bool, str] = True,
              resample=True, reverse_indicators=False,
@@ -1541,6 +1643,9 @@ class Backtest:
 
         If `plot_drawdown` is `True`, the resulting plot will contain
         a separate drawdown graph section.
+
+        If `plot_trades` is `True`, the stretches between trade entries
+        and trade exits are marked by hash-marked tractor beams.
 
         If `smooth_equity` is `True`, the equity graph will be
         interpolated between fixed points at trade closing times,
@@ -1600,6 +1705,7 @@ class Backtest:
             plot_pl=plot_pl,
             plot_volume=plot_volume,
             plot_drawdown=plot_drawdown,
+            plot_trades=plot_trades,
             smooth_equity=smooth_equity,
             relative_equity=relative_equity,
             superimpose=superimpose,

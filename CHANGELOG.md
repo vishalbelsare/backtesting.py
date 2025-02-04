@@ -5,6 +5,60 @@ These were the major changes contributing to each release:
 
 ### 0.x.x
 
+### 0.6.1
+(2025-02-04)
+
+Enhancement: Use `joblib.Parallel` for optimization.
+This should vastly improve performance on Windows while not
+affecting other platforms too much.
+
+
+### 0.6.0
+(2025-02-04)
+
+* Enhancements:
+  * Add `Backtest(spread=)`; change `Backtest(commission=)` to apply twice per trade
+  * Show paid "Commissions [$]" key in trade stats
+  * Allow multiple names for vector indicators (#980)
+  * Add columns SL and TP to `stats['trades']` (#1039)
+  * Add entry/exit indicator values to `stats['trades']` (#1116)
+  * Optionally finalize trades at the end of backtest run (#393)
+* Bug fixes, including for some long-standing bugs:
+  * Fix bug in Sharpe ratio with non-zero risk-free rate (#904)
+  * Change price comparisons to lte/gte to align with TradingView
+  * Reduce optimization memory footprint (#884)
+  * Fix annualized stats with weekly/monthly data
+  * Fix `AssertionError` on `for o in self.orders: o.cancel()`
+  * Fix plot not shown in VSCode Jupyter
+  * Buy&Hold duration now matches trading duration
+  * Fix `bt.plot(resample=True)` with categorical indicators
+* Several other small bug fixes, deprecations and docs updates.
+
+
+### 0.5.0
+(2025-01-21)
+
+* Enhancements:
+  * New `Backtest.optimize(method="sambo")`;
+    uses [SAMBO](https://sambo-optimization.github.io):
+    to replace `method="skopt"`.
+  * New 'CAGR [%]' (compound annual growth rate) statistic.
+* Bug fixes:
+  * "stop-loss executed at a higher than market price".
+  * Bug with buy/sell size=0.
+  * `Order.__repr__` issue with non-numeric `Order.tag`.
+* Other small fixes, deprecations and docs updates.
+
+
+### 0.4.0
+(2025-01-21)
+
+* Enhancements:
+  * 'Kelly Criterion' statistic (#640)
+  * `Backtest.plot(plot_trades=)` parameter
+  * Order.tag for tracking orders and trades (#200)
+* Small bug fixes, deprecation removals and documentation updates.
+
 
 ### 0.3.3
 (2021-12-13)

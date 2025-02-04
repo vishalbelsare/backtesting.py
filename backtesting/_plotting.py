@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import os
 import re
 import sys
@@ -16,7 +18,7 @@ from bokeh.colors.named import (
     tomato as BEAR_COLOR
 )
 from bokeh.plotting import figure as _figure
-from bokeh.models import (
+from bokeh.models import (  # type: ignore
     CrosshairTool,
     CustomJS,
     ColumnDataSource,
@@ -31,20 +33,21 @@ from bokeh.models import (
 try:
     from bokeh.models import CustomJSTickFormatter
 except ImportError:  # Bokeh < 3.0
-    from bokeh.models import FuncTickFormatter as CustomJSTickFormatter
+    from bokeh.models import FuncTickFormatter as CustomJSTickFormatter  # type: ignore
 from bokeh.io import output_notebook, output_file, show
 from bokeh.io.state import curstate
 from bokeh.layouts import gridplot
 from bokeh.palettes import Category10
 from bokeh.transform import factor_cmap
 
-from backtesting._util import _data_period, _as_list, _Indicator
+from backtesting._util import _data_period, _as_list, _Indicator, try_
 
 with open(os.path.join(os.path.dirname(__file__), 'autoscale_cb.js'),
           encoding='utf-8') as _f:
     _AUTOSCALE_JS_CALLBACK = _f.read()
 
-IS_JUPYTER_NOTEBOOK = 'JPY_PARENT_PID' in os.environ
+IS_JUPYTER_NOTEBOOK = ('JPY_PARENT_PID' in os.environ or
+                       'inline' in os.environ.get('MPLBACKEND', ''))
 
 if IS_JUPYTER_NOTEBOOK:
     warnings.warn('Jupyter Notebook detected. '
@@ -88,7 +91,7 @@ def colorgen():
 def lightness(color, lightness=.94):
     rgb = np.array([color.r, color.g, color.b]) / 255
     h, _, s = rgb_to_hls(*rgb)
-    rgb = np.array(hls_to_rgb(h, lightness, s)) * 255
+    rgb = (np.array(hls_to_rgb(h, lightness, s)) * 255).astype(int)
     return RGB(*rgb)
 
 
@@ -103,18 +106,18 @@ def _maybe_resample_data(resample_rule, df, indicators, equity_data, trades):
             return df, indicators, equity_data, trades
 
         freq_minutes = pd.Series({
-            "1T": 1,
-            "5T": 5,
-            "10T": 10,
-            "15T": 15,
-            "30T": 30,
-            "1H": 60,
-            "2H": 60*2,
-            "4H": 60*4,
-            "8H": 60*8,
+            "1min": 1,
+            "5min": 5,
+            "10min": 10,
+            "15min": 15,
+            "30min": 30,
+            "1h": 60,
+            "2h": 60*2,
+            "4h": 60*4,
+            "8h": 60*8,
             "1D": 60*24,
             "1W": 60*24*7,
-            "1M": np.inf,
+            "1ME": np.inf,
         })
         timespan = df.index[-1] - df.index[0]
         require_minutes = (timespan / _MAX_CANDLES).total_seconds() // 60
@@ -125,8 +128,15 @@ def _maybe_resample_data(resample_rule, df, indicators, equity_data, trades):
     from .lib import OHLCV_AGG, TRADES_AGG, _EQUITY_AGG
     df = df.resample(freq, label='right').agg(OHLCV_AGG).dropna()
 
-    indicators = [_Indicator(i.df.resample(freq, label='right').mean()
-                             .dropna().reindex(df.index).values.T,
+    def try_mean_first(indicator):
+        nonlocal freq
+        resampled = indicator.df.fillna(np.nan).resample(freq, label='right')
+        try:
+            return resampled.mean()
+        except Exception:
+            return resampled.first()
+
+    indicators = [_Indicator(try_mean_first(i).dropna().reindex(df.index).values.T,
                              **dict(i._opts, name=i.name,
                                     # Replace saved index with the resampled one
                                     index=df.index))
@@ -141,11 +151,11 @@ def _maybe_resample_data(resample_rule, df, indicators, equity_data, trades):
         return ((df['Size'].abs() * df['ReturnPct']) / df['Size'].abs().sum()).sum()
 
     def _group_trades(column):
-        def f(s, new_index=pd.Index(df.index.view(int)), bars=trades[column]):
+        def f(s, new_index=pd.Index(df.index.astype(int)), bars=trades[column]):
             if s.size:
                 # Via int64 because on pandas recently broken datetime
-                mean_time = int(bars.loc[s.index].view(int).mean())
-                new_bar_idx = new_index.get_loc(mean_time, method='nearest')
+                mean_time = int(bars.loc[s.index].astype(int).mean())
+                new_bar_idx = new_index.get_indexer([mean_time], method='nearest')[0]
                 return new_bar_idx
         return f
 
@@ -166,7 +176,7 @@ def plot(*, results: pd.Series,
          indicators: List[_Indicator],
          filename='', plot_width=None,
          plot_equity=True, plot_return=False, plot_pl=True,
-         plot_volume=True, plot_drawdown=False,
+         plot_volume=True, plot_drawdown=False, plot_trades=True,
          smooth_equity=False, relative_equity=True,
          superimpose=True, resample=True,
          reverse_indicators=True,
@@ -220,11 +230,11 @@ def plot(*, results: pd.Series,
 
     pad = (index[-1] - index[0]) / 20
 
-    fig_ohlc = new_bokeh_figure(
-        x_range=Range1d(index[0], index[-1],
-                        min_interval=10,
-                        bounds=(index[0] - pad,
-                                index[-1] + pad)) if index.size > 1 else None)
+    _kwargs = dict(x_range=Range1d(index[0], index[-1],
+                                   min_interval=10,
+                                   bounds=(index[0] - pad,
+                                           index[-1] + pad))) if index.size > 1 else {}
+    fig_ohlc = new_bokeh_figure(**_kwargs)
     figs_above_ohlc, figs_below_ohlc = [], []
 
     source = ColumnDataSource(df)
@@ -247,8 +257,8 @@ def plot(*, results: pd.Series,
     if is_datetime_index:
         fig_ohlc.xaxis.formatter = CustomJSTickFormatter(
             args=dict(axis=fig_ohlc.xaxis[0],
-                      formatter=DatetimeTickFormatter(days=['%d %b', '%a %d'],
-                                                      months=['%m/%Y', "%b'%y"]),
+                      formatter=DatetimeTickFormatter(days='%a, %d %b',
+                                                      months='%m/%Y'),
                       source=source),
             code='''
 this.labels = this.labels || formatter.doFormat(ticks
@@ -257,7 +267,7 @@ this.labels = this.labels || formatter.doFormat(ticks
 return this.labels[index] || "";
         ''')
 
-    NBSP = '\N{NBSP}' * 4
+    NBSP = '\N{NBSP}' * 4  # noqa: E999
     ohlc_extreme_values = df[['High', 'Low']].copy(deep=False)
     ohlc_tooltips = [
         ('x, y', NBSP.join(('$index',
@@ -440,11 +450,11 @@ return this.labels[index] || "";
         """Superimposed, downsampled vbars"""
         time_resolution = pd.DatetimeIndex(df['datetime']).resolution
         resample_rule = (superimpose if isinstance(superimpose, str) else
-                         dict(day='M',
+                         dict(day='ME',
                               hour='D',
-                              minute='H',
-                              second='T',
-                              millisecond='S').get(time_resolution))
+                              minute='h',
+                              second='min',
+                              millisecond='s').get(time_resolution))
         if not resample_rule:
             warnings.warn(
                 f"'Can't superimpose OHLC data with rule '{resample_rule}'"
@@ -537,10 +547,23 @@ return this.labels[index] || "";
             colors = value._opts['color']
             colors = colors and cycle(_as_list(colors)) or (
                 cycle([next(ohlc_colors)]) if is_overlay else colorgen())
-            legend_label = LegendStr(value.name)
-            for j, arr in enumerate(value, 1):
+
+            if isinstance(value.name, str):
+                tooltip_label = value.name
+                if len(value) == 1:
+                    legend_labels = [LegendStr(value.name)]
+                else:
+                    legend_labels = [
+                        LegendStr(f"{value.name}[{i}]")
+                        for i in range(len(value))
+                    ]
+            else:
+                tooltip_label = ", ".join(value.name)
+                legend_labels = [LegendStr(item) for item in value.name]
+
+            for j, arr in enumerate(value):
                 color = next(colors)
-                source_name = f'{legend_label}_{i}_{j}'
+                source_name = f'{legend_labels[j]}_{i}_{j}'
                 if arr.dtype == bool:
                     arr = arr.astype(int)
                 source.add(arr, source_name)
@@ -548,29 +571,29 @@ return this.labels[index] || "";
                 if is_overlay:
                     ohlc_extreme_values[source_name] = arr
                     if is_scatter:
-                        fig.scatter(
+                        fig.circle(
                             'index', source_name, source=source,
-                            legend_label=legend_label, color=color,
+                            legend_label=legend_labels[j], color=color,
                             line_color='black', fill_alpha=.8,
-                            marker='circle', radius=BAR_WIDTH / 2 * 1.5)
+                            radius=BAR_WIDTH / 2 * .9)
                     else:
                         fig.line(
                             'index', source_name, source=source,
-                            legend_label=legend_label, line_color=color,
+                            legend_label=legend_labels[j], line_color=color,
                             line_width=1.3)
                 else:
                     if is_scatter:
-                        r = fig.scatter(
+                        r = fig.circle(
                             'index', source_name, source=source,
-                            legend_label=LegendStr(legend_label), color=color,
-                            marker='circle', radius=BAR_WIDTH / 2 * .9)
+                            legend_label=legend_labels[j], color=color,
+                            radius=BAR_WIDTH / 2 * .6)
                     else:
                         r = fig.line(
                             'index', source_name, source=source,
-                            legend_label=LegendStr(legend_label), line_color=color,
+                            legend_label=legend_labels[j], line_color=color,
                             line_width=1.3)
                     # Add dashed centerline just because
-                    mean = float(pd.Series(arr).mean())
+                    mean = try_(lambda: float(pd.Series(arr).mean()), default=np.nan)
                     if not np.isnan(mean) and (abs(mean) < .1 or
                                                round(abs(mean), 1) == .5 or
                                                round(abs(mean), -1) in (50, 100, 200)):
@@ -578,9 +601,9 @@ return this.labels[index] || "";
                                             line_color='#666666', line_dash='dashed',
                                             line_width=.5))
             if is_overlay:
-                ohlc_tooltips.append((legend_label, NBSP.join(tooltips)))
+                ohlc_tooltips.append((tooltip_label, NBSP.join(tooltips)))
             else:
-                set_tooltips(fig, [(legend_label, NBSP.join(tooltips))], vline=True, renderers=[r])
+                set_tooltips(fig, [(tooltip_label, NBSP.join(tooltips))], vline=True, renderers=[r])
                 # If the sole indicator line on this figure,
                 # have the legend only contain text without the glyph
                 if len(value) == 1:
@@ -609,7 +632,8 @@ return this.labels[index] || "";
         _plot_superimposed_ohlc()
 
     ohlc_bars = _plot_ohlc()
-    _plot_ohlc_trades()
+    if plot_trades:
+        _plot_ohlc_trades()
     indicator_figs = _plot_indicators()
     if reverse_indicators:
         indicator_figs = indicator_figs[::-1]
@@ -625,7 +649,7 @@ return this.labels[index] || "";
     if plot_volume:
         custom_js_args.update(volume_range=fig_volume.y_range)
 
-    fig_ohlc.x_range.js_on_change('end', CustomJS(args=custom_js_args,
+    fig_ohlc.x_range.js_on_change('end', CustomJS(args=custom_js_args,  # type: ignore
                                                   code=_AUTOSCALE_JS_CALLBACK))
 
     plots = figs_above_ohlc + [fig_ohlc] + figs_below_ohlc
@@ -650,7 +674,7 @@ return this.labels[index] || "";
 
         f.add_tools(linked_crosshair)
         wheelzoom_tool = next(wz for wz in f.tools if isinstance(wz, WheelZoomTool))
-        wheelzoom_tool.maintain_focus = False
+        wheelzoom_tool.maintain_focus = False  # type: ignore
 
     kwargs = {}
     if plot_width is None:
@@ -662,7 +686,7 @@ return this.labels[index] || "";
         toolbar_location='right',
         toolbar_options=dict(logo=None),
         merge_tools=True,
-        **kwargs
+        **kwargs  # type: ignore
     )
     show(fig, browser=None if open_browser else 'none')
     return fig
@@ -674,6 +698,9 @@ def plot_heatmaps(heatmap: pd.Series, agg: Union[Callable, str], ncols: int,
             isinstance(heatmap.index, pd.MultiIndex)):
         raise ValueError('heatmap must be heatmap Series as returned by '
                          '`Backtest.optimize(..., return_heatmap=True)`')
+    if len(heatmap.index.levels) < 2:
+        raise ValueError('`plot_heatmap()` requires at least two optimization '
+                         'variables to plot')
 
     _bokeh_reset(filename)
 
@@ -719,7 +746,7 @@ def plot_heatmaps(heatmap: pd.Series, agg: Union[Callable, str], ncols: int,
         plots.append(fig)
 
     fig = gridplot(
-        plots,
+        plots,  # type: ignore
         ncols=ncols,
         toolbar_options=dict(logo=None),
         toolbar_location='above',

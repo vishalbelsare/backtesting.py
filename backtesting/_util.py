@@ -1,6 +1,8 @@
+from __future__ import annotations
+
 import warnings
-from typing import Dict, List, Optional, Sequence, Union, cast
 from numbers import Number
+from typing import Dict, List, Optional, Sequence, Union, cast
 
 import numpy as np
 import pandas as pd
@@ -38,6 +40,21 @@ def _data_period(index) -> Union[pd.Timedelta, Number]:
     """Return data index period as pd.Timedelta"""
     values = pd.Series(index[-100:])
     return values.diff().dropna().median()
+
+
+def _strategy_indicators(strategy):
+    return {attr: indicator
+            for attr, indicator in strategy.__dict__.items()
+            if isinstance(indicator, _Indicator)}.items()
+
+
+def _indicator_warmup_nbars(strategy):
+    if strategy is None:
+        return 0
+    nbars = max((np.isnan(indicator.astype(float)).argmin(axis=-1).max()
+                 for _, indicator in _strategy_indicators(strategy)
+                 if not indicator._opts['scatter']), default=0)
+    return nbars
 
 
 class _Array(np.ndarray):
@@ -109,7 +126,7 @@ class _Data:
     """
     def __init__(self, df: pd.DataFrame):
         self.__df = df
-        self.__i = len(df)
+        self.__len = len(df)  # Current length
         self.__pip: Optional[float] = None
         self.__cache: Dict[str, _Array] = {}
         self.__arrays: Dict[str, _Array] = {}
@@ -124,8 +141,8 @@ class _Data:
         except KeyError:
             raise AttributeError(f"Column '{item}' not in data") from None
 
-    def _set_length(self, i):
-        self.__i = i
+    def _set_length(self, length):
+        self.__len = length
         self.__cache.clear()
 
     def _update(self):
@@ -136,18 +153,18 @@ class _Data:
         self.__arrays['__index'] = index
 
     def __repr__(self):
-        i = min(self.__i, len(self.__df) - 1)
+        i = min(self.__len, len(self.__df)) - 1
         index = self.__arrays['__index'][i]
         items = ', '.join(f'{k}={v}' for k, v in self.__df.iloc[i].items())
         return f'<Data i={i} ({index}) {items}>'
 
     def __len__(self):
-        return self.__i
+        return self.__len
 
     @property
     def df(self) -> pd.DataFrame:
-        return (self.__df.iloc[:self.__i]
-                if self.__i < len(self.__df)
+        return (self.__df.iloc[:self.__len]
+                if self.__len < len(self.__df)
                 else self.__df)
 
     @property
@@ -160,7 +177,7 @@ class _Data:
     def __get_array(self, key) -> _Array:
         arr = self.__cache.get(key)
         if arr is None:
-            arr = self.__cache[key] = cast(_Array, self.__arrays[key][:self.__i])
+            arr = self.__cache[key] = cast(_Array, self.__arrays[key][:self.__len])
         return arr
 
     @property
